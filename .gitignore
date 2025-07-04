@@ -1,0 +1,18 @@
+# Byte-compiled / cache
+__pycache__/
+*.pyc
+
+# Log files & session data
+*.log
+*.txt
+
+# Environment / OS files
+.env
+.DS_Store
+
+# IDE / editor folders
+.vscode/
+.idea/
+
+# Selenium user profile
+ChromeSeleniumProfile/
