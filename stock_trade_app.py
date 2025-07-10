@@ -11,21 +11,29 @@ import time
 import pytz
 import pandas as pd
 import glob
+import webbrowser
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.keys import Keys
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
+
+log_dir = BASE_DIR / "Log Files"
+log_dir.mkdir(exist_ok=True)
 
 CHROME_DRIVER_PATH = BASE_DIR / "chromedriver.exe"
 CHROME_PROFILE_PATH = BASE_DIR / "ChromeSeleniumProfile"
 
 def load_latest_tracked_tickers():
-    log_files = sorted(glob.glob("*.txt"), key=os.path.getmtime, reverse=True)
+    log_dir = Path(__file__).parent / "Log Files"
+    if not log_dir.exists():
+        return []
+    log_files = sorted(log_dir.glob("*.txt"), key=os.path.getmtime, reverse=True)
     for log_file in log_files:
         with open(log_file, "r") as f:
             for line in f:
@@ -49,11 +57,13 @@ class MultiIndexTrackerFrame(ttk.LabelFrame):
         self.ax.grid(True)
 
         self.lines = {}
+        friendly_labels = {"^DJI": "DOW", "^IXIC": "NASDAQ", "^GSPC": "S&P500"}
         for symbol in self.symbols:
-            line, = self.ax.plot([], [], label=symbol)
+            line, = self.ax.plot([], [], label=friendly_labels.get(symbol, symbol))
             self.lines[symbol] = line
 
         self.ax.legend()
+ 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self)
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
@@ -98,6 +108,7 @@ class StockTrackerFrame(ttk.LabelFrame):
         self.refresh_interval_ms = 10000
         self.highlight_price = None
         self.last_cached_df = None
+        self.tooltip = None
 
         self.default_font = ("Helvetica", 15)
 
@@ -115,7 +126,8 @@ class StockTrackerFrame(ttk.LabelFrame):
         self.ax.xaxis.set_major_formatter(formatter)
         self.ax.set_xlabel("Time")
         self.ax.set_ylabel("Price ($)")
-        self.ax.set_title(company_name, fontsize=18, fontweight='bold')
+        self.title_text = self.ax.set_title(company_name, fontsize=18, fontweight='bold')
+        self.title_text.set_picker(True)
         self.ax.grid(True)
 
         self.line, = self.ax.plot([], [], label=self.stock_symbol)
@@ -124,6 +136,9 @@ class StockTrackerFrame(ttk.LabelFrame):
         self.canvas = FigureCanvasTkAgg(self.fig, master=self)
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
+
+        self.canvas.mpl_connect("pick_event", self.on_title_click)
+        self.canvas.mpl_connect("motion_notify_event", self.on_hover)
 
         self.controls = ttk.Frame(self)
         self.controls.pack(fill=tk.X, padx=2, pady=2)
@@ -152,7 +167,6 @@ class StockTrackerFrame(ttk.LabelFrame):
 
         self.load_button = ttk.Button(self.top_controls, text="Load", command=self.update_symbol)
         self.load_button.grid(row=0, column=5, sticky="w", padx=4)
-        self.load_button.config(style="Big.TButton")
 
         self.bottom_controls = ttk.Frame(self.controls)
         self.bottom_controls.pack(fill=tk.X, pady=(5,0))
@@ -180,6 +194,43 @@ class StockTrackerFrame(ttk.LabelFrame):
 
         self.after(initial_delay_ms, self.update_graph)
 
+    def on_title_click(self, event):
+        if event.artist == self.title_text:
+            self.hide_tooltip()
+            url = f"https://finance.yahoo.com/quote/{self.stock_symbol}/news/"
+            webbrowser.open(url)
+
+    def on_hover(self, event):
+        contains, _ = self.title_text.contains(event)
+        if contains:
+            self.show_tooltip(event)
+        else:
+            self.hide_tooltip()
+
+    def show_tooltip(self, event):
+        if self.tooltip is None:
+            self.tooltip = tk.Toplevel(self)
+            self.tooltip.wm_overrideredirect(True)
+            self.tooltip.attributes("-topmost", True)
+            label = tk.Label(self.tooltip,
+                             text=f"Current {self.stock_symbol} News",
+                             font=("Helvetica", 12),
+                             bg="yellow", relief="solid", bd=1)
+            label.pack(ipadx=5, ipady=2)
+        # offset
+        offset_x = 20
+        offset_y = 10
+        x = self.winfo_pointerx()
+        y = self.winfo_pointery()
+        self.tooltip.geometry(f"+{x + offset_x}+{y + offset_y}")
+
+        self.after(1000, self.hide_tooltip)
+
+    def hide_tooltip(self):
+        if self.tooltip is not None:
+            self.tooltip.destroy()
+            self.tooltip = None
+
     def update_symbol(self):
         new_symbol = self.symbol_entry.get().strip().upper()
         if new_symbol:
@@ -193,10 +244,10 @@ class StockTrackerFrame(ttk.LabelFrame):
                 return
             self.stock_symbol = new_symbol
             self.highlight_price = None
-            company_name = yf.Ticker(self.stock_symbol).info.get('longName')
-            self.ax.set_title(company_name, fontsize=18, fontweight='bold')
+            company_name = yf.Ticker(self.stock_symbol).info.get('longName', self.stock_symbol)
+            self.title_text = self.ax.set_title(company_name, fontsize=18, fontweight='bold')
+            self.canvas.draw_idle()
             self.update_graph()
-            self.company_name = yf.Ticker(new_symbol).info.get("shortName", new_symbol)
 
     def is_positive_number(self,value):
         try:
@@ -365,8 +416,8 @@ class StockTrackerFrame(ttk.LabelFrame):
                     self.purchase_lines = []
 
                 if isinstance(self.highlight_price, (float, int)):
-                    h1 = self.ax.axhline(y=self.highlight_price, color="green", linestyle="--", label="Purchase Price")
-                    h2 = self.ax.axhline(y=self.highlight_price * 1.01, color="red", linestyle="--", label="Sell Price")
+                    h1 = self.ax.axhline(y=self.highlight_price, color="green", linestyle="-", label="Purchase Price")
+                    h2 = self.ax.axhline(y=self.highlight_price * 1.01, color="red", linestyle="-", label="Sell Price")
                     self.hlines.extend([h1, h2])
 
                 self.ax.legend()
@@ -385,7 +436,7 @@ class StockApp(tk.Tk):
 
         now = datetime.now()
         filename = now.strftime("%d%b%y_%H.%M.%S.txt")
-        log_path = BASE_DIR / filename
+        log_path = log_dir / filename
         self.log_file = open(log_path, "a")
         self.log_file.write(f"Session started at {now.strftime('%Y-%m-%d %H:%M:%S')}\n")
         self.log_file.flush()
@@ -435,21 +486,62 @@ class StockApp(tk.Tk):
             self.after(0, lambda: self.status_label.config(text="Starting browser..."))
             self.driver = self.start_driver()
             self.after(0, lambda: self.status_label.config(text="Browser started."))
+            self.start_keepalive_monitor()
         except Exception as e:
             self.after(0, lambda: self.status_label.config(text=f"Error starting browser: {e}"))
             self.after(0, lambda: messagebox.showerror("Browser Error", f"Could not start Selenium:\n{e}"))
 
+    def start_keepalive_monitor(self):
+        def keepalive_check():
+            while True:
+                time.sleep(5)
+                try:
+                    if not self.driver or not self.driver.service.process:
+                        raise Exception("Driver process missing.")
+                    _ = self.driver.title
+                except Exception:
+                    self.restart_browser()
+                    break
+        threading.Thread(target=keepalive_check, daemon=True).start()
+
+    def restart_browser(self):
+        try:
+            self.status_label.config(text="Browser closed. Restarting...")
+            self.driver = self.start_driver()
+            self.status_label.config(text="Browser restarted.")
+            self.start_keepalive_monitor()
+        except Exception as e:
+            self.status_label.config(text=f"Error restarting: {e}")
+
     def start_driver(self):
-        service = Service(executable_path=str(CHROME_DRIVER_PATH))
+        service = Service(executable_path="chromedriver.exe")
         options = webdriver.ChromeOptions()
         options.add_argument("start-maximized")
-        options.add_argument(f"--user-data-dir={CHROME_PROFILE_PATH}")
         options.add_argument("--disable-extensions")
         options.add_argument("--disable-popup-blocking")
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])
         options.add_experimental_option('useAutomationExtension', False)
-        return webdriver.Chrome(service=service, options=options)
+
+        driver = webdriver.Chrome(service=service, options=options)
+        print("✅ Selenium Chrome driver started successfully.")
+
+        # Go immediately to the saved Fidelity page
+        driver.get("https://digital.fidelity.com/ftgw/digital/trade-equity/index/orderEntry")
+
+        # Wait loop: keep checking until we're logged in and reach the target page
+        wait = WebDriverWait(driver, 300)  # up to 5 min
+        while True:
+            try:
+                # Example: look for an element that only exists on the trading page
+                wait.until(EC.presence_of_element_located((By.ID, "eq-ticket-dest-symbol")))
+                print("✅ Logged in and trading page loaded.")
+                break
+            except:
+                print("⌛ Waiting for login to complete...")
+                time.sleep(3)
+
+        return driver
 
     def _launch_selenium_order(self, symbol, amount, action_text, tracker_frame=None):
         try:
@@ -463,21 +555,11 @@ class StockApp(tk.Tk):
             driver.execute_script("window.open('https://digital.fidelity.com/ftgw/digital/trade-equity/index/orderEntry', '_blank');")
             driver.switch_to.window(driver.window_handles[-1])
             wait.until(lambda d: d.execute_script('return document.readyState') == 'complete')
-            time.sleep(3)
+            time.sleep(2)
             symbol_input = wait.until(EC.visibility_of_element_located((By.ID, "eq-ticket-dest-symbol")))
             symbol_input.clear()
             symbol_input.send_keys(symbol)
-            symbol_input.send_keys("\t")
-            try:
-                simplified = WebDriverWait(driver, 2).until(EC.element_to_be_clickable((
-                    By.XPATH, "//s-assigned-wrapper[normalize-space()='View simplified ticket']"
-                )))
-                simplified.click()
-            except:
-                expanded = driver.find_elements(By.XPATH, "//s-assigned-wrapper[normalize-space()='View expanded ticket']")
-                if not expanded:
-                    self.status_label.config(text="Ticket type elements missing.")
-                    return
+            symbol_input.send_keys(Keys.TAB)
             action_button = wait.until(EC.element_to_be_clickable((
                 By.XPATH, f"//s-assigned-wrapper[normalize-space()='{action_text.capitalize()}']"
             )))
@@ -535,7 +617,7 @@ class StockApp(tk.Tk):
                 child.sell_button.config(state="disabled")
                 child.reset_button.config(state="normal")
                 for h in list(child.hlines):
-                    if hasattr(h, 'get_linestyle') and (h.get_linestyle() == '--'):
+                    if hasattr(h, 'get_linestyle') and (h.get_linestyle() == '-'):
                         h.remove()
                 child.hlines.clear()
                 child.highlight_price = None
