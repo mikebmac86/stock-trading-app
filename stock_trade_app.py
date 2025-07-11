@@ -76,24 +76,47 @@ class MultiIndexTrackerFrame(ttk.LabelFrame):
 
     def update_plot(self):
         try:
+            any_data = False
+            now = datetime.now(self.eastern)
+            tz = self.eastern
+            today = now.date()
+            start_time = self.eastern.localize(datetime.combine(today, dt_time(9,30)))
+            end_time = self.eastern.localize(datetime.combine(today, dt_time(16,0)))
+
+            in_trading_hours = start_time <= now <= end_time
+
             for symbol in self.symbols:
-                df = yf.download(symbol, period="1d", interval="1m", progress=False, auto_adjust=True)
-                df.dropna(inplace=True)
-                if df.empty:
-                    df = self.last_cached_dfs.get(symbol)
-                    if df is None:
-                        continue
+                interval = "1m" if in_trading_hours else "5m"
+                df_full = yf.download(symbol, period="2d", interval=interval, progress=False, auto_adjust=True)
+                df_full.dropna(inplace=True)
+                if df_full.empty:
+                    continue
+                df_full.index = df_full.index.tz_convert(tz)
+
+                df_today = df_full[df_full.index.date == today]
+                yesterday = today - pd.Timedelta(days=1)
+                df_yesterday = df_full[df_full.index.date == yesterday]
+
+                if in_trading_hours and not df_today.empty:
+                    df = df_today
+                    ref_price = df_yesterday["Close"].iloc[-1] if not df_yesterday.empty else df["Close"].iloc[0]
                 else:
-                    self.last_cached_dfs[symbol] = df
-                if not df.empty:
-                    df.index = df.index.tz_convert(self.eastern)
-                    prices = df["Close"]
-                    normalized = (prices / prices.iloc[0] * 100) - 100
-                    self.lines[symbol].set_data(df.index, normalized)
-            self.ax.relim()
-            self.ax.autoscale_view()
-            self.ax.legend()
-            self.canvas.draw()
+                    most_recent_date = df_full.index.date.max()
+                    df = df_full[df_full.index.date == most_recent_date]
+                    if df.empty or df["Close"].empty:
+                        continue
+                    ref_price = df["Close"].iloc[0]
+                normalized = (df["Close"] / ref_price * 100) - 100
+                self.lines[symbol].set_data(df.index, normalized)
+                any_data = True
+
+            if any_data:
+                self.ax.relim()
+                self.ax.autoscale_view()
+                self.ax.set_xlim([start_time, end_time])
+                self.ax.legend()
+                self.canvas.draw()
+
         except Exception as e:
             print(f"Graph update error in indices tracker: {e}")
 
@@ -197,7 +220,7 @@ class StockTrackerFrame(ttk.LabelFrame):
     def on_title_click(self, event):
         if event.artist == self.title_text:
             self.hide_tooltip()
-            url = f"https://finance.yahoo.com/quote/{self.stock_symbol}/news/"
+            url = f"https://finance.yahoo.com/quote/{self.stock_symbol}/latest-news/"
             webbrowser.open(url)
 
     def on_hover(self, event):
@@ -217,7 +240,6 @@ class StockTrackerFrame(ttk.LabelFrame):
                              font=("Helvetica", 12),
                              bg="yellow", relief="solid", bd=1)
             label.pack(ipadx=5, ipady=2)
-        # offset
         offset_x = 20
         offset_y = 10
         x = self.winfo_pointerx()
@@ -225,6 +247,20 @@ class StockTrackerFrame(ttk.LabelFrame):
         self.tooltip.geometry(f"+{x + offset_x}+{y + offset_y}")
 
         self.after(1000, self.hide_tooltip)
+
+    def clear_all_horizontal_lines(self):
+        for line in list(self.ax.lines):
+            ydata = line.get_ydata()        
+            if len(ydata) > 0:
+                try:
+                    ref_y = float(ydata.iloc[0])
+                except AttributeError:
+                    ref_y = float(ydata[0]) 
+                if all(y == ref_y for y in ydata):
+                    try:
+                        line.remove()
+                    except ValueError:
+                        pass
 
     def hide_tooltip(self):
         if self.tooltip is not None:
@@ -234,6 +270,7 @@ class StockTrackerFrame(ttk.LabelFrame):
     def update_symbol(self):
         new_symbol = self.symbol_entry.get().strip().upper()
         if new_symbol:
+            self.clear_all_horizontal_lines()
             try:
                 df = yf.download(new_symbol, period="1d", interval="1m", progress=False, auto_adjust=True)
                 df.dropna(inplace=True)
@@ -242,12 +279,18 @@ class StockTrackerFrame(ttk.LabelFrame):
             except Exception:
                 messagebox.showerror("Invalid Symbol", f"The ticker '{new_symbol}' could not be loaded.\nPlease check the symbol and try again.")
                 return
+
             self.stock_symbol = new_symbol
+            print(self.highlight_price)
             self.highlight_price = None
             company_name = yf.Ticker(self.stock_symbol).info.get('longName', self.stock_symbol)
             self.title_text = self.ax.set_title(company_name, fontsize=18, fontweight='bold')
+            self.line.set_label(self.stock_symbol)
+            if self.ax.legend_:
+                self.ax.legend_.remove()
+            self.ax.legend()
+            self.update_plot()
             self.canvas.draw_idle()
-            self.update_graph()
 
     def is_positive_number(self,value):
         try:
@@ -288,7 +331,7 @@ class StockTrackerFrame(ttk.LabelFrame):
         self.update_plot()
         self.post_sale_action()
         self.amount_label.config(text="Amount ($):")
-        self.app.enable_all_trackers()  # re-enable all trackers
+        self.app.enable_all_trackers()
         threading.Thread(
             target=self.app._launch_selenium_order,
             args=(self.stock_symbol, self.amount, "sell"),
@@ -336,9 +379,9 @@ class StockTrackerFrame(ttk.LabelFrame):
         if not self.is_positive_number(self.amount):
             messagebox.showerror("Input Error", "Amount must be a positive number.")
             return
-        self.app.disable_all_trackers()  # disables all other buttons
+        self.app.disable_all_trackers()
         self.buy_button.config(state="disabled")
-        self.sell_button.config(state="normal")  # keep sell for this tracker
+        self.sell_button.config(state="normal")
         self.reset_button.config(state="normal")
         self.amount_label.config(text="Amount (Shares):")
         threading.Thread(
@@ -370,60 +413,90 @@ class StockTrackerFrame(ttk.LabelFrame):
         if not self.stock_symbol:
             return 
         try:
-            df = yf.download(self.stock_symbol, period="1d", interval="1m", progress=False, auto_adjust=True)
-            df.dropna(inplace=True)
-            if df.empty:
-                if self.last_cached_df is not None:
-                    df = self.last_cached_df
+            target_date = datetime(2025, 7, 9).date()
+            stock_symbol = self.stock_symbol
+            tz = self.eastern
+            now = datetime.now(tz)
+            today = now.date()
+            start_time = tz.localize(datetime.combine(today, dt_time(9,30)))
+            end_time = tz.localize(datetime.combine(today, dt_time(16,0)))
+            in_trading_hours = start_time <= now <= end_time
+
+            # Always get 2 days to have yesterday for prepending
+            df_full = yf.download(self.stock_symbol, period="2d", interval="1m", progress=False, auto_adjust=True)
+            df_full.dropna(inplace=True)
+            if df_full.empty:
+                return
+            df_full.index = df_full.index.tz_convert(tz)
+
+            df_yesterday = df_full[df_full.index.date == (today - pd.Timedelta(days=1))]
+            df_today = df_full[df_full.index.date == today]
+
+            if in_trading_hours:
+                if not df_today.empty:
+                    if not df_yesterday.empty:
+                        last_close_yesterday = df_yesterday["Close"].iloc[-1].item()
+                        first_time_today = df_today.index[0] - pd.Timedelta(minutes=1)
+                        prepend_df = pd.DataFrame({"Close": [last_close_yesterday]}, index=[first_time_today])
+                        prepend_array = pd.concat([prepend_df, df_today])
+                        merged_series = prepend_array[("Close", stock_symbol)].combine_first(prepend_array[("Close")])
+                        df = merged_series.to_frame(name="Close")
+                        ref_price = last_close_yesterday
+                    else:
+                        df = df_today
+                        ref_price = df["Close"].iloc[0].item()
                 else:
-                    return
+                    df = df_full[df_full.index.date == target_date]
+                    ref_price = df["Close"].iloc[0].item()
             else:
-                self.last_cached_df = df
-            if not df.empty:
-                df.index = df.index.tz_convert(self.eastern)
-                current_prices = df["Close"]
-                if isinstance(current_prices, pd.DataFrame):
-                    current_prices = current_prices[self.stock_symbol]
+                df = df_full[df_full.index.date == target_date]
+                ref_price = df["Close"].iloc[0].item()
 
-                self.line.set_data(df.index, current_prices)
-                self.line.set_label(self.stock_symbol)
-                self.ax.relim()
-                self.ax.autoscale_view()
+            # Plotting
+            current_prices = df["Close"]
+            self.line.set_data(df.index, current_prices)
+            self.line.set_label(self.stock_symbol)
+            self.ax.relim()
+            self.ax.autoscale_view()
 
-                tz = df.index[-1].tz
-                today = df.index[-1].date()
-                start_time = self.eastern.localize(datetime.combine(today, dt_time(9,30))).astimezone(tz)
-                end_time = self.eastern.localize(datetime.combine(today, dt_time(16,0))).astimezone(tz)
+            first_ts = df.index[0].to_pydatetime()
+            last_ts = df.index[-1].to_pydatetime()
+            if (first_ts <= start_time) and (last_ts >= end_time):
+                self.ax.set_xlim([start_time, end_time])
+            else:
+                self.ax.set_xlim([df.index[0], df.index[-1]])
 
-                if (df.index[0] <= start_time) and (df.index[-1] >= end_time):
-                    self.ax.set_xlim([start_time, end_time])
-                else:
-                    self.ax.set_xlim([df.index[0], df.index[-1]])
-
-                for h in self.hlines:
+            # Reference lines
+            for h in self.hlines:
+                try:
                     h.remove()
-                self.hlines.clear()
+                except ValueError:
+                    print("Line already removed or not present on this axes.")                
+            self.hlines.clear()
+            self.hlines.append(self.ax.axhline(y=ref_price * 1.01, color="blue", linestyle="--"))
+            self.hlines.append(self.ax.axhline(y=ref_price * 0.99, color="blue", linestyle="--"))
 
-                first_y = current_prices.iloc[0]
-                self.hlines.append(self.ax.axhline(y=first_y * 1.01, color="blue", linestyle="--"))
-                self.hlines.append(self.ax.axhline(y=first_y * 0.99, color="blue", linestyle="--"))
-
-                if hasattr(self, 'purchase_lines'):
-                    for l in self.purchase_lines:
+            # Purchase lines
+            if hasattr(self, 'purchase_lines'):
+                self.purchase_lines = [l for l in self.purchase_lines if l in self.ax.lines]
+                for l in self.purchase_lines:
+                    try:
                         l.remove()
-                    self.purchase_lines.clear()
-                else:
-                    self.purchase_lines = []
+                    except ValueError:
+                        print("Line already removed or not present on this axes.")
+                self.purchase_lines.clear()
 
-                if isinstance(self.highlight_price, (float, int)):
-                    h1 = self.ax.axhline(y=self.highlight_price, color="green", linestyle="-", label="Purchase Price")
-                    h2 = self.ax.axhline(y=self.highlight_price * 1.01, color="red", linestyle="-", label="Sell Price")
-                    self.hlines.extend([h1, h2])
+            if isinstance(self.highlight_price, (float, int)):
+                h1 = self.ax.axhline(y=self.highlight_price, color="green", linestyle="-", label="Purchase Price")
+                h2 = self.ax.axhline(y=self.highlight_price * 1.01, color="red", linestyle="-", label="Sell Price")
+                self.hlines.extend([h1, h2])
 
-                self.ax.legend()
-                self.canvas.draw()
+            self.ax.legend()
+            self.canvas.draw()
+
         except Exception as e:
-            print(f"Graph update error: {e}") 
+            print(f"Graph update error: {e}")
+
 
 class StockApp(tk.Tk):
     def __init__(self):
@@ -431,7 +504,6 @@ class StockApp(tk.Tk):
         self.title("8-Tracker Stock Viewer with Normalized Index + Staggered Updates + Trade Autofill")
         self.geometry("1700x950")
 
-        # Get prior tracked tickers if any
         tracked_tickers = load_latest_tracked_tickers()
 
         now = datetime.now()
@@ -488,7 +560,7 @@ class StockApp(tk.Tk):
             self.after(0, lambda: self.status_label.config(text="Browser started."))
             self.start_keepalive_monitor()
         except Exception as e:
-            self.after(0, lambda: self.status_label.config(text=f"Error starting browser: {e}"))
+            self.after(0, lambda e=e: self.status_label.config(text=f"Error starting browser: {e}"))
             self.after(0, lambda: messagebox.showerror("Browser Error", f"Could not start Selenium:\n{e}"))
 
     def start_keepalive_monitor(self):
@@ -514,7 +586,7 @@ class StockApp(tk.Tk):
             self.status_label.config(text=f"Error restarting: {e}")
 
     def start_driver(self):
-        service = Service(executable_path="chromedriver.exe")
+        service = Service(executable_path=str(CHROME_DRIVER_PATH))
         options = webdriver.ChromeOptions()
         options.add_argument("start-maximized")
         options.add_argument("--disable-extensions")
@@ -526,28 +598,40 @@ class StockApp(tk.Tk):
         driver = webdriver.Chrome(service=service, options=options)
         print("✅ Selenium Chrome driver started successfully.")
 
-        # Go immediately to the saved Fidelity page
         driver.get("https://digital.fidelity.com/ftgw/digital/trade-equity/index/orderEntry")
 
-        # Wait loop: keep checking until we're logged in and reach the target page
-        wait = WebDriverWait(driver, 300)  # up to 5 min
+        wait = WebDriverWait(driver, 300)
+        target_url_snippet = "/ftgw/digital/trade-equity/index/orderEntry"
+
         while True:
             try:
-                # Example: look for an element that only exists on the trading page
+                current_url = driver.current_url
+                if target_url_snippet in current_url:
+                    print(f"✅ Trading page URL detected: {current_url}")
+                    break
+
                 wait.until(EC.presence_of_element_located((By.ID, "eq-ticket-dest-symbol")))
                 print("✅ Logged in and trading page loaded.")
                 break
             except:
-                print("⌛ Waiting for login to complete...")
+                print(f"⌛ Waiting for login to complete... Currently at {current_url}")
                 time.sleep(3)
 
         return driver
 
-    def _launch_selenium_order(self, symbol, amount, action_text, tracker_frame=None):
+    def ensure_browser_alive(self):
         try:
             if not self.driver or not self.driver.service.process:
-                self.status_label.config(text="Browser was closed.")
-                return
+                raise Exception("Browser not running.")
+            _ = self.driver.title
+        except Exception:
+            self.status_label.config(text="Browser lost. Restarting...")
+            self.restart_browser()
+
+    def _launch_selenium_order(self, symbol, amount, action_text, tracker_frame=None):
+        try:
+            self.ensure_browser_alive()
+
             self.status_label.config(text=f"Running trade autofill ({action_text.capitalize()})...")
 
             driver = self.driver
@@ -560,25 +644,44 @@ class StockApp(tk.Tk):
             symbol_input.clear()
             symbol_input.send_keys(symbol)
             symbol_input.send_keys(Keys.TAB)
+
+            xpath_query = f"//s-assigned-wrapper[normalize-space()='{action_text.capitalize()}']"
+            buttons = driver.find_elements(By.XPATH, xpath_query)
+            for b in buttons:
+                print(f" - Button text: '{b.text}'")
+
             action_button = wait.until(EC.element_to_be_clickable((
                 By.XPATH, f"//s-assigned-wrapper[normalize-space()='{action_text.capitalize()}']"
             )))
+            driver.execute_script("arguments[0].scrollIntoView(true);", action_button)
+            time.sleep(0.2)
             action_button.click()
+
+            if action_text.lower() == "buy":
+                type_label = "Dollars"
+            else:
+                type_label = "Shares"
             type_option = wait.until(EC.element_to_be_clickable((
-                By.XPATH, "//s-assigned-wrapper[normalize-space()='Dollars']"
+                By.XPATH, f"//s-assigned-wrapper[normalize-space()='{type_label}']"
             )))
+            driver.execute_script("arguments[0].scrollIntoView(true);", type_option)
             type_option.click()
+
             quantity_input = wait.until(EC.visibility_of_element_located((By.ID, "eqt-shared-quantity")))
             quantity_input.clear()
             quantity_input.send_keys(amount)
             market_option = wait.until(EC.element_to_be_clickable((
                 By.XPATH, "//s-assigned-wrapper[normalize-space()='Market']"
             )))
+            driver.execute_script("arguments[0].scrollIntoView(true);", market_option)
             market_option.click()
+
             cash_option = wait.until(EC.element_to_be_clickable((
                 By.XPATH, "//s-assigned-wrapper[normalize-space()='Cash']"
             )))
+            driver.execute_script("arguments[0].scrollIntoView(true);", cash_option)
             cash_option.click()
+
             line = f"[{datetime.now().strftime('%H:%M:%S')}] Executed {action_text.capitalize()}: {symbol}, Qty: {amount}, Market, Cash\n"
             self.log_file.write(line)
             self.log_file.flush()
@@ -593,7 +696,6 @@ class StockApp(tk.Tk):
             elif action_text.lower() == "sell" and tracker_frame:
                 tracker_frame.post_sale_action()
 
-            # Always reset status finally
             self.status_label.config(text=f"{action_text.capitalize()} completed. Ready.")
 
         except Exception as e:
@@ -625,9 +727,8 @@ class StockApp(tk.Tk):
 
     def _check_elements_thread(self):
         try:
-            if not self.driver or not self.driver.service.process:
-                self.status_label.config(text="Browser was closed.")
-                return
+            self.ensure_browser_alive()
+
             self.status_label.config(text="Checking Fidelity site elements...")
             driver = self.driver
             wait = WebDriverWait(driver, 20)
@@ -661,16 +762,30 @@ class StockApp(tk.Tk):
                     tickers.append(child.stock_symbol)
 
             if tickers:
-                # write in single line format
                 self.log_file.write("\nTRACKED_TICKERS:" + ",".join(tickers) + "\n")
                 self.log_file.flush()
 
             if hasattr(self, 'driver') and self.driver:
-                self.driver.quit()
+                try:
+                    self.driver.quit()
+                except Exception as e:
+                    print(f"Driver quit failed: {e}")
+                try:
+                    self.driver.service.stop()
+                except Exception as e:
+                    print(f"Service stop failed: {e}")
+                try:
+                    if self.driver.service.process:
+                        self.driver.service.process.kill()
+                except Exception as e:
+                    print(f"Direct kill failed: {e}")
         except Exception as e:
-            print(f"Error during close: {e}")
+            print(f"Unexpected error on close: {e}")
         finally:
-            self.log_file.close()
+            try:
+                self.log_file.close()
+            except:
+                pass
             self.destroy()
             os._exit(0)
 
