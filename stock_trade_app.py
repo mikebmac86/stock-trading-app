@@ -12,6 +12,7 @@ import pytz
 import pandas as pd
 import glob
 import webbrowser
+import numpy as np
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -46,7 +47,7 @@ class MultiIndexTrackerFrame(ttk.LabelFrame):
         super().__init__(parent, text="Index Tracker")
         self.eastern = pytz.timezone("US/Eastern")
         self.symbols = ["^DJI", "^IXIC", "^GSPC"]
-        self.refresh_interval_ms = 10000
+        self.refresh_interval_ms = 60000
         self.last_cached_dfs = {}
 
         self.fig, self.ax = plt.subplots(figsize=(4, 2.5), dpi=100)
@@ -77,45 +78,95 @@ class MultiIndexTrackerFrame(ttk.LabelFrame):
     def update_plot(self):
         try:
             any_data = False
-            now = datetime.now(self.eastern)
-            tz = self.eastern
+            now = datetime.now(pytz.UTC)
             today = now.date()
-            start_time = self.eastern.localize(datetime.combine(today, dt_time(9,30)))
-            end_time = self.eastern.localize(datetime.combine(today, dt_time(16,0)))
+            start_time = pd.Timestamp(f"{today} 13:30:00", tz="UTC")
+            end_time = pd.Timestamp(f"{today} 20:00:00", tz="UTC")
 
             in_trading_hours = start_time <= now <= end_time
+
+            for line in self.lines.values():
+                line.set_data([], [])
+
+            for child in self.ax.lines[3:]:
+                child.remove()
 
             for symbol in self.symbols:
                 interval = "1m" if in_trading_hours else "5m"
                 df_full = yf.download(symbol, period="2d", interval=interval, progress=False, auto_adjust=True)
                 df_full.dropna(inplace=True)
+
                 if df_full.empty:
                     continue
-                df_full.index = df_full.index.tz_convert(tz)
 
-                df_today = df_full[df_full.index.date == today]
-                yesterday = today - pd.Timedelta(days=1)
-                df_yesterday = df_full[df_full.index.date == yesterday]
+                if isinstance(df_full.columns, pd.MultiIndex):
+                    close_col = ('Close', symbol)
+                    if close_col in df_full.columns:
+                        df_full = df_full[close_col].to_frame(name='Close')
+                    else:
+                        continue
+                elif symbol in df_full.columns:
+                    df_full = df_full[[symbol]].rename(columns={symbol: 'Close'})
+                elif 'Close' in df_full.columns:
+                    df_full = df_full[['Close']]
+                else:
+                    continue
+
+                today_date = today
+                yesterday_date = today - pd.Timedelta(days=1)
+
+                df_today = df_full[df_full.index.date == today_date]
+                df_yesterday = df_full[df_full.index.date == yesterday_date]
+
+                most_recent_date = df_full.index.normalize().max()
+                df_most_recent = df_full[df_full.index.normalize() == most_recent_date]
 
                 if in_trading_hours and not df_today.empty:
                     df = df_today
-                    ref_price = df_yesterday["Close"].iloc[-1] if not df_yesterday.empty else df["Close"].iloc[0]
+                    if not df_yesterday.empty:
+                        ref_price = df_yesterday["Close"].iloc[-1]
+                        print(f"Using yesterday close: {ref_price}")
+                    else:
+                        ref_price = df["Close"].iloc[0]
+                        print(f"No yesterday data, using today first close: {ref_price}")
                 else:
-                    most_recent_date = df_full.index.date.max()
-                    df = df_full[df_full.index.date == most_recent_date]
+                    df = df_most_recent
                     if df.empty or df["Close"].empty:
                         continue
                     ref_price = df["Close"].iloc[0]
+
                 normalized = (df["Close"] / ref_price * 100) - 100
-                self.lines[symbol].set_data(df.index, normalized)
+
+                self.lines[symbol].set_data(df.index.to_pydatetime(), normalized.values)
+
                 any_data = True
 
             if any_data:
                 self.ax.relim()
                 self.ax.autoscale_view()
-                self.ax.set_xlim([start_time, end_time])
+
+                eastern = pytz.timezone("US/Eastern")
+                formatter = mdates.DateFormatter('%I:%M %p', tz=eastern)
+                self.ax.xaxis.set_major_formatter(formatter)
+    
+                all_times = []
+                for line in self.lines.values():
+                    xdata = line.get_xdata()
+                    if len(xdata) > 0:
+                        all_times.extend(xdata)
+
+                if all_times:
+                    min_time = min(all_times)
+                    max_time = max(all_times)
+                    self.ax.set_xlim([min_time, max_time])
+
+                else:
+                    print("⚠ No data points found to set xlim. Keeping autoscale only.")
+
                 self.ax.legend()
                 self.canvas.draw()
+            else:
+                print("⚠ No data found to plot any line.")
 
         except Exception as e:
             print(f"Graph update error in indices tracker: {e}")
@@ -128,7 +179,7 @@ class StockTrackerFrame(ttk.LabelFrame):
         self.eastern = pytz.timezone("US/Eastern")
         self.stock_symbol = initial_symbol if initial_symbol else ""
         self.amount = "50"
-        self.refresh_interval_ms = 10000
+        self.refresh_interval_ms = 60000
         self.highlight_price = None
         self.last_cached_df = None
         self.tooltip = None
@@ -281,7 +332,6 @@ class StockTrackerFrame(ttk.LabelFrame):
                 return
 
             self.stock_symbol = new_symbol
-            print(self.highlight_price)
             self.highlight_price = None
             company_name = yf.Ticker(self.stock_symbol).info.get('longName', self.stock_symbol)
             self.title_text = self.ax.set_title(company_name, fontsize=18, fontweight='bold')
@@ -299,7 +349,6 @@ class StockTrackerFrame(ttk.LabelFrame):
             return False
 
     def reset_buttons(self):
-       
         confirm = messagebox.askyesno(
             "Confirm Reset",
             "Are you sure you want to reset this tracker?\n"
@@ -308,18 +357,12 @@ class StockTrackerFrame(ttk.LabelFrame):
         if not confirm:
             return
 
+        self.highlight_price = None
+        self.update_plot()
         self.buy_button.config(state="normal")
         self.sell_button.config(state="disabled")
         self.amount_label.config(text="Amount ($):")
         self.app.status_label.config(text="Buttons reset: Buy enabled, Sell disabled.")
-
-        if hasattr(self, 'purchase_lines'):
-            for l in self.purchase_lines:
-                l.remove()
-            self.purchase_lines.clear()
-
-        self.highlight_price = None
-
         self.canvas.draw()
 
     def mark_price_and_sell(self):
@@ -397,10 +440,6 @@ class StockTrackerFrame(ttk.LabelFrame):
             df = yf.download(self.stock_symbol, period="1d", interval="1m", progress=False, auto_adjust=True)
             df.dropna(inplace=True)
             if not df.empty:
-                if df.index.tz is None:
-                    df.index = df.index.tz_localize('UTC').tz_convert(self.eastern)
-                else:
-                    df.index = df.index.tz_convert(self.eastern)
                 return df["Close"].iloc[-1].item()
         except Exception:
             return None
@@ -413,77 +452,110 @@ class StockTrackerFrame(ttk.LabelFrame):
         if not self.stock_symbol:
             return 
         try:
-            target_date = datetime(2025, 7, 9).date()
             stock_symbol = self.stock_symbol
-            tz = self.eastern
-            now = datetime.now(tz)
+            now = datetime.now(pytz.UTC)
             today = now.date()
-            start_time = tz.localize(datetime.combine(today, dt_time(9,30)))
-            end_time = tz.localize(datetime.combine(today, dt_time(16,0)))
-            in_trading_hours = start_time <= now <= end_time
+            weekday = now.weekday()  # Monday=0, Sunday=6
+
+            # Define trading hours in UTC (approximate; adjust for exchange if needed)
+            start_time_utc = pd.Timestamp(f"{today} 13:30:00", tz="UTC")
+            end_time_utc = pd.Timestamp(f"{today} 20:00:00", tz="UTC")
+
+            in_trading_hours = start_time_utc <= now <= end_time_utc
 
             # Always get 2 days to have yesterday for prepending
             df_full = yf.download(self.stock_symbol, period="2d", interval="1m", progress=False, auto_adjust=True)
             df_full.dropna(inplace=True)
             if df_full.empty:
                 return
-            df_full.index = df_full.index.tz_convert(tz)
+            # Keep index in UTC (default from yfinance)
 
-            df_yesterday = df_full[df_full.index.date == (today - pd.Timedelta(days=1))]
-            df_today = df_full[df_full.index.date == today]
+            # Normalize for clean slicing
+            date_index = df_full.index.normalize()
+            target_yesterday = pd.Timestamp(today - pd.Timedelta(days=1))
+            target_today = pd.Timestamp(today)
+            most_recent_date = date_index.max()
 
-            if in_trading_hours:
+            df_yesterday = df_full[date_index == target_yesterday]
+            df_today = df_full[date_index == target_today]
+
+            # 🔍 1) Handle outside trading hours first (including weekends)
+            if not in_trading_hours or weekday >= 5:
+                # Use full day slice for last available day
+                start_of_day = most_recent_date
+                end_of_day = start_of_day + pd.Timedelta(days=1)
+                df = df_full.loc[start_of_day:end_of_day - pd.Timedelta(microseconds=1)]
+                if not df.empty:
+                    ref_price = df["Close"].iloc[0]
+                    if isinstance(ref_price, pd.Series):
+                        ref_price = ref_price.iloc[0]
+                else:
+                    return
+
+            # 🔍 2) Otherwise, handle trading hours during the week
+            else:
                 if not df_today.empty:
                     if not df_yesterday.empty:
-                        last_close_yesterday = df_yesterday["Close"].iloc[-1].item()
+                        last_close_yesterday = df_yesterday["Close"].iloc[-1]
                         first_time_today = df_today.index[0] - pd.Timedelta(minutes=1)
                         prepend_df = pd.DataFrame({"Close": [last_close_yesterday]}, index=[first_time_today])
                         prepend_array = pd.concat([prepend_df, df_today])
-                        merged_series = prepend_array[("Close", stock_symbol)].combine_first(prepend_array[("Close")])
+                        merged_series = prepend_array["Close"]
                         df = merged_series.to_frame(name="Close")
                         ref_price = last_close_yesterday
                     else:
                         df = df_today
-                        ref_price = df["Close"].iloc[0].item()
+                        ref_price = df["Close"].iloc[0]
+                        if isinstance(ref_price, pd.Series):
+                            ref_price = ref_price.iloc[0]
                 else:
-                    df = df_full[df_full.index.date == target_date]
-                    ref_price = df["Close"].iloc[0].item()
-            else:
-                df = df_full[df_full.index.date == target_date]
-                ref_price = df["Close"].iloc[0].item()
+                    # trading hours but no data? fallback
+                    start_of_day = most_recent_date
+                    end_of_day = start_of_day + pd.Timedelta(days=1)
+                    df = df_full.loc[start_of_day:end_of_day - pd.Timedelta(microseconds=1)]
+                    if not df.empty:
+                        ref_price = df["Close"].iloc[0]
+                        if isinstance(ref_price, pd.Series):
+                            ref_price = ref_price.iloc[0]
+                    else:
+                        return
 
-            # Plotting
+            # 🔍 Plotting
             current_prices = df["Close"]
+            if isinstance(current_prices, pd.DataFrame):
+                current_prices = current_prices.iloc[:,0]
             self.line.set_data(df.index, current_prices)
             self.line.set_label(self.stock_symbol)
             self.ax.relim()
             self.ax.autoscale_view()
 
+            # x-axis still in UTC but format ticks in Eastern for readability
+            eastern = pytz.timezone("US/Eastern")
+            formatter = mdates.DateFormatter('%I:%M %p', tz=eastern)
+            self.ax.xaxis.set_major_formatter(formatter)
+
             first_ts = df.index[0].to_pydatetime()
             last_ts = df.index[-1].to_pydatetime()
-            if (first_ts <= start_time) and (last_ts >= end_time):
-                self.ax.set_xlim([start_time, end_time])
+            if (first_ts <= start_of_day) and (last_ts >= end_of_day):
+                self.ax.set_xlim([start_of_day, end_of_day])
             else:
                 self.ax.set_xlim([df.index[0], df.index[-1]])
 
-            # Reference lines
+            # 🔍 Reference bands
             for h in self.hlines:
-                try:
-                    h.remove()
-                except ValueError:
-                    print("Line already removed or not present on this axes.")                
+                h.remove()
             self.hlines.clear()
             self.hlines.append(self.ax.axhline(y=ref_price * 1.01, color="blue", linestyle="--"))
             self.hlines.append(self.ax.axhline(y=ref_price * 0.99, color="blue", linestyle="--"))
 
-            # Purchase lines
+            # 🔍 Purchase lines
             if hasattr(self, 'purchase_lines'):
                 self.purchase_lines = [l for l in self.purchase_lines if l in self.ax.lines]
                 for l in self.purchase_lines:
                     try:
                         l.remove()
                     except ValueError:
-                        print("Line already removed or not present on this axes.")
+                        pass
                 self.purchase_lines.clear()
 
             if isinstance(self.highlight_price, (float, int)):
@@ -647,8 +719,6 @@ class StockApp(tk.Tk):
 
             xpath_query = f"//s-assigned-wrapper[normalize-space()='{action_text.capitalize()}']"
             buttons = driver.find_elements(By.XPATH, xpath_query)
-            for b in buttons:
-                print(f" - Button text: '{b.text}'")
 
             action_button = wait.until(EC.element_to_be_clickable((
                 By.XPATH, f"//s-assigned-wrapper[normalize-space()='{action_text.capitalize()}']"
